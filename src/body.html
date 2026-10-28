@@ -1,0 +1,29 @@
+<div class="app">
+  <aside class="rail" aria-label="Sections">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 3v12h12" fill="none" stroke="var(--accent-ink)" stroke-width="2.2" stroke-linecap="round"/><path d="M6 11l3-3 2 2 4-5" fill="none" stroke="var(--accent-ink)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <b>Ledgerline</b>
+    </div>
+    <nav id="railNav" class="stack" style="gap:2px"></nav>
+    <div class="spacer"></div>
+    <button class="btn primary" id="railImport" type="button">Import statements</button>
+    <div class="store-badge" id="storeBadge"><span class="dot"></span><span>Connecting…</span></div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <div class="topbar-in">
+        <h1 id="viewTitle">Overview</h1>
+        <div class="monthpick" id="monthPick">
+          <button type="button" id="mPrev" aria-label="Previous month">‹</button>
+          <span id="mLabel" class="num">—</span>
+          <button type="button" id="mNext" aria-label="Next month">›</button>
+        </div>
+        <button class="btn hide-m" id="addTxTop" type="button">Add transaction</button>
+      </div>
+    </header>
+    <div class="wrap" id="view"></div>
+  </main>
+  <nav class="tabbar" id="tabbar" aria-label="Sections"></nav>
+</div>
+<div id="sheetRoot"></div>
+<div id="toastRoot" aria-live="polite"></div>
