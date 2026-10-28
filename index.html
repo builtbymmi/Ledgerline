@@ -530,7 +530,7 @@ const COLS = {
   debit: /debit|withdrawal|money out|outflow|payments?$|charges?$|spent/i,
   credit: /credit|deposit|money in|inflow|receipts?/i,
   category: /^category$|^type of spend|^classification/i,
-  type: /^(transaction )?type$|^dr\/cr$|credit\/debit|debit\/credit/i
+  type: /^(transaction )?type$|^dr\/cr$|credit\/debit|debit\/credit|credit debit indicator|debit credit indicator|^indicator$/i
 };
 function detectHeader(rows) {
   for (let i = 0; i < Math.min(rows.length, 25); i++) {
@@ -597,7 +597,35 @@ function parseOFX(text) {
 }
 
 /* ---------- PDF text fallback (no Claude) ---------- */
+/* Navy Federal statement layout: "MM-DD  description  12.34 -  5,678.90" (trailing " -" = money out),
+   long descriptions wrap onto the next line, and the year comes from the statement period. Checking sections only. */
+function parseNFCUText(text) {
+  const per = String(text).match(/(\d\d)\/(\d\d)\/(\d\d)\s*-\s*(\d\d)\/(\d\d)\/(\d\d)/);
+  if (!per || !/Statement of Account|navyfederal|Navy Federal/i.test(text)) return null;
+  const sm = +per[1], sy = 2000 + +per[3], em = +per[4], ey = 2000 + +per[6];
+  const out = []; let inAcct = false, pend = null;
+  const amtRe = /^(.*?)\s*([\d,]+\.\d\d)( -)?\s+(-?[\d,]+\.\d\d)\s*$/;
+  for (const raw of String(text).split('\n')) {
+    const l = raw.trim(); if (!l) continue;
+    if (/\b(Checking|Savings)\b.*\s-\s\d{6,}/.test(l) && !/^\d\d-\d\d/.test(l)) { inAcct = /Checking/.test(l); pend = null; continue; }
+    if (!inAcct) continue;
+    const m = l.match(/^(\d\d)-(\d\d)\s+(.*)$/);
+    if (m) {
+      const mo = +m[1], dd = +m[2]; let yr = ey; if (sm > em && mo >= sm) yr = sy; else if (sm < em && mo === sm && sy !== ey) yr = sy;
+      const date = yr + '-' + pad(mo) + '-' + pad(dd); const rest = m[3];
+      if (/Beginning Balance/i.test(rest)) { pend = null; continue; }
+      if (/Ending Balance/i.test(rest)) { inAcct = false; pend = null; continue; }
+      const a = rest.match(amtRe);
+      if (a) { out.push({ date, desc: a[1].trim(), amount: round2(parseFloat(a[2].replace(/,/g, '')) * (a[3] ? -1 : 1)) }); pend = null; }
+      else pend = { date, desc: rest.trim() };
+      continue;
+    }
+    if (pend) { const a = l.match(amtRe); if (a) { out.push({ date: pend.date, desc: (pend.desc + ' ' + a[1]).trim(), amount: round2(parseFloat(a[2].replace(/,/g, '')) * (a[3] ? -1 : 1)) }); pend = null; } else if (!/^Page \d|Statement|Access No|Joint Owner|Date\s+Transaction/i.test(l)) pend.desc += ' ' + l; }
+  }
+  return out.length ? out : null;
+}
 function regexExtractStatement(text) {
+  const nf = parseNFCUText(text); if (nf) return nf;
   const yr = (String(text).match(/\b(20[2-3]\d)\b/) || [])[1]; const out = [];
   for (const line of String(text).split('\n')) {
     const m = line.trim().match(/^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+(?:\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\s+)?(.+?)\s+(-?\(?\$?[\d,]+\.\d{2}\)?-?)(?:\s+-?\$?[\d,]+\.\d{2})?$/);
@@ -631,7 +659,7 @@ function parsePositions(rows) {
 function txKey(t) { return t.accountId + '|' + t.date + '|' + Number(t.amount).toFixed(2) + '|' + String(t.desc).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 14); }
 function buildTransactions(records, accountId) {
   const counts = {}; for (const t of state.transactions) { const k = txKey(t); counts[k] = (counts[k] || 0) + 1; }
-  const added = [], dupes = [];
+  const added = [], dupes = [], replaced = [];
   const catByName = {}; for (const c of state.categories) catByName[c.name.toLowerCase()] = c.id;
   for (const r of records) {
     const t = { id: uid(), date: r.date, desc: r.desc, amount: round2(r.amount), accountId, merchant: merchantName(r.desc), categoryId: 'uncat', notes: '', tags: [], business: false, excluded: false };
@@ -640,10 +668,19 @@ function buildTransactions(records, accountId) {
     const c = categorize(t); t.categoryId = c.cat; applyRuleExtras(t, c.rule);
     if (fromFile && !c.rule && (c.cat === 'uncat' || c.cat === 'income2')) t.categoryId = fromFile;
     if (t.categoryId === 'bizinc' || t.categoryId === 'business') t.business = true;
+    const p = takePending(t); if (p) replaced.push(p);
     added.push(t);
   }
-  return { added, dupes };
+  return { added, dupes, replaced };
 }
+
+/* A charge entered by hand as "Pending" is replaced when the posted version arrives
+   (same account, same amount, within 6 days). Returns the removed pending transaction. */
+function takePending(t) {
+  const i = state.transactions.findIndex(x => x.accountId === t.accountId && /pending/i.test(x.notes || '') && Math.abs(x.amount - t.amount) < 0.005 && Math.abs(daysBetween(x.date, t.date)) <= 6);
+  if (i < 0) return null; return state.transactions.splice(i, 1)[0];
+}
+function lastPostedDate(accountId) { let d = null; for (const t of state.transactions) if (t.accountId === accountId && !/pending/i.test(t.notes || '') && (!d || t.date > d)) d = t.date; return d; }
 
 /* ---------- Analytics ---------- */
 function derive() {
@@ -1630,7 +1667,7 @@ const loaded = {};
 function loadScript(src) { return loaded[src] || (loaded[src] = new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Could not load a helper library. Check your connection and try again.')); }; document.head.appendChild(s); })); }
 function importSheet() {
   ui.imp = { step: 'pick' };
-  const body = `<label class="drop" id="drop" for="fileIn"><span>${ico('up', 28)}</span><b>Drop statements here, or tap to choose</b><span class="muted" style="font-size:13px">CSV · Excel (.xlsx/.xls) · OFX/QFX · PDF statements · screenshots · Ledgerline backup (.json)</span></label>
+  const body = `<label class="drop" id="drop" for="fileIn"><span>${ico('up', 28)}</span><b>Drop statements here, or tap to choose</b><span class="muted" style="font-size:13px">CSV · Excel (.xlsx/.xls) · OFX/QFX · PDF statements${SAMPLE ? ' · screenshots' : ''} · Ledgerline files (.json)</span></label>
   <input type="file" id="fileIn" multiple hidden accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm,.ofx,.qfx,.qbo,.pdf,.png,.jpg,.jpeg,.webp,.json">
   <details><summary class="ink2" style="cursor:pointer;font-weight:600">Paste from Google Sheets or Excel</summary><p class="muted" style="font-size:13px;margin:6px 0">Select the cells (include the header row) and copy, then paste below.</p><textarea class="input" id="pasteBox" rows="5" style="width:100%" placeholder="Date	Description	Amount"></textarea><div style="margin-top:8px"><button class="btn sm" type="button" data-act="usePaste">Use pasted rows</button></div></details>
   <details><summary class="ink2" style="cursor:pointer;font-weight:600">Where to find the download at your bank</summary><div class="stack" style="font-size:13.5px;margin-top:8px;gap:6px">
@@ -1663,7 +1700,8 @@ async function nextFile() {
   const name = f.name || 'pasted'; const ext = (name.split('.').pop() || '').toLowerCase();
   working('Reading ' + name + '…');
   try {
-    if (ext === 'json') { const data = JSON.parse(await readText(f)); if (!data || !Array.isArray(data.transactions) || !Array.isArray(data.categories)) throw new Error('That JSON file is not a Ledgerline backup.'); ui.imp = { ...ui.imp, kind: 'backup', data, file: name }; return backupStep(); }
+    if (ext === 'json') { const data = JSON.parse(await readText(f)); if (data && data.kind === 'ledgerline-import' && Array.isArray(data.transactions)) { ui.imp = { ...ui.imp, kind: 'llimport', data, file: name }; return llImportStep(); }
+      if (!data || !Array.isArray(data.transactions) || !Array.isArray(data.categories)) throw new Error('That JSON file is not a Ledgerline backup.'); ui.imp = { ...ui.imp, kind: 'backup', data, file: name }; return backupStep(); }
     if (['ofx', 'qfx', 'qbo'].includes(ext)) { const r = parseOFX(await readText(f)); if (!r.records.length) throw new Error('No transactions found in that OFX/QFX file.'); ui.imp = { ...ui.imp, kind: 'records', records: r.records, balance: r.balance, file: name, flip: false }; return recordsStep(); }
     if (ext === 'pdf') return pdfFile(f, name);
     if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) return imageFiles([f], name);
@@ -1687,7 +1725,13 @@ function acctPicker() {
   const im = ui.imp; const guess = im.acctId || (state.demo ? '' : (state.accounts.find(a => im.file && im.file.toLowerCase().includes(a.name.toLowerCase().split(' ')[0])) || {}).id) || '';
   const realAccts = state.demo ? [] : state.accounts;
   return `<div class="form"><label class="f">Import into account<select class="input" id="impAcct" data-on="change:impAcct"><option value="__new"${!guess ? ' selected' : ''}>New account…</option>${realAccts.map(a => `<option value="${a.id}"${a.id === guess ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+  <label class="switch full" id="cutW" hidden><input type="checkbox" id="impCut" checked> <span id="cutTxt"></span></label>
   <span id="newAcctW" class="form" style="grid-column:1/-1;${guess ? 'display:none' : ''}"><label class="f">Account name<input class="input" id="impName" value="${esc(im.newName || (im.file || '').replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 40))}"></label><label class="f">Type<select class="input" id="impType">${Object.entries(ACCT_TYPES).filter(([k]) => ['checking', 'savings', 'credit', 'cash', 'loan', 'brokerage', 'k401', 'roth', 'ira', 'hsa', 'crypto'].includes(k)).map(([k, v]) => `<option value="${k}"${(im.newType || 'checking') === k ? ' selected' : ''}>${v.label}</option>`).join('')}</select></label></span></div>`;
+}
+function updateCut() {
+  const w = $('#cutW'), sel = $('#impAcct'); if (!w || !sel) return;
+  const last = sel.value !== '__new' ? lastPostedDate(sel.value) : null;
+  w.hidden = !last; if (last) $('#cutTxt').textContent = `Only add transactions after ${dShort(last)}, the latest already in this account. Turn off to bring in older ones (exact repeats are still skipped).`;
 }
 function previewTable(records) {
   const sample = records.slice(0, 8);
@@ -1704,6 +1748,7 @@ function mapStep() {
     <div class="note">${outCount} of ${records.length} rows are money out. Purchases should show with a minus sign below; if they don't, tick the box above.</div>
     ${acctPicker()}${previewTable(records)}`;
   setFoot(`<button class="btn ghost" data-act="import" type="button">Back</button><button class="btn primary" data-act="doImport" type="button"${records.length ? '' : ' disabled'}>Import ${records.length} transactions</button>`);
+  updateCut();
 }
 function recordsStep() {
   const im = ui.imp; const records = im.records.map(r => ({ ...r, amount: im.flip ? -r.amount : r.amount }));
@@ -1711,6 +1756,7 @@ function recordsStep() {
     <label class="switch"><input type="checkbox" id="flipSign" data-on="change:flip"${im.flip ? ' checked' : ''}> Flip all signs (if purchases show as positive)</label>
     ${acctPicker()}${previewTable(records)}${im.via ? '<div class="note">Read from a PDF or image. Spot-check a few amounts against your statement before relying on the totals.</div>' : ''}`;
   setFoot(`<button class="btn ghost" data-act="import" type="button">Back</button><button class="btn primary" data-act="doImport" type="button"${records.length ? '' : ' disabled'}>Import ${records.length} transactions</button>`);
+  updateCut();
 }
 function positionsStep() {
   const im = ui.imp; const inv = state.demo ? [] : state.accounts.filter(isInvest);
@@ -1720,6 +1766,43 @@ function positionsStep() {
     <div class="scrollx"><table class="ltable"><thead><tr><th>Symbol</th><th>Class</th><th class="r">Shares</th><th class="r">Price</th><th class="r">Value</th></tr></thead><tbody>${im.holdings.slice(0, 30).map(h => `<tr><td><b>${esc(h.sym)}</b><div class="muted" style="font-size:12px">${esc(h.name.slice(0, 40))}</div></td><td>${esc(h.cls)}</td><td class="r num">${h.shares}</td><td class="r num">${money(h.price, true)}</td><td class="r num">${money(h.shares * h.price, true)}</td></tr>`).join('')}</tbody></table></div>
     <div class="note">Importing replaces that account's holdings with this snapshot and records today's value in your net worth history.</div>`;
   setFoot(`<button class="btn ghost" data-act="import" type="button">Back</button><button class="btn primary" data-act="doPositions" type="button">Save holdings</button>`);
+}
+function llImportStep() {
+  const d = ui.imp.data; const ds = d.transactions.map(t => t.date).sort();
+  $('.sheet-b').innerHTML = `<div class="stack"><h2 style="font-size:20px">${esc(d.title || 'Transactions prepared by Claude')}</h2>
+    <div class="kv"><span>Transactions</span><span class="num">${d.transactions.length}</span></div>
+    ${ds.length ? `<div class="kv"><span>Dates</span><span>${dShort(ds[0])} – ${dShort(ds[ds.length - 1])}</span></div>` : ''}
+    ${(d.accounts || []).map(a => `<div class="kv"><span>${esc(a.name)}</span><span class="num">${a.balance != null ? money(a.balance, true) + (a.balanceAsOf ? ' on ' + dShort(a.balanceAsOf) : '') : ''}</span></div>`).join('')}
+    <div class="note">These get added to what you already have. Anything already in Ledgerline is skipped, and charges you entered as pending are swapped for the posted versions.</div></div>`;
+  setFoot(`<button class="btn ghost" data-act="import" type="button">Back</button><button class="btn primary" data-act="doLLImport" type="button">Add to my ledger</button>`);
+}
+function applyLedgerFile(d) {
+  ensureReal();
+  for (const c of d.categories || []) if (c && c.id && !CATMAP[c.id]) state.categories.push({ id: c.id, name: c.name || c.id, group: GROUPS[c.group] ? c.group : 'wants' });
+  rebuildCats();
+  const amap = {};
+  for (const a of d.accounts || []) {
+    let ex = state.accounts.find(x => x.id === a.id) || state.accounts.find(x => x.name.toLowerCase() === String(a.name || '').toLowerCase());
+    if (!ex) { ex = { id: a.id || uid(), name: a.name || 'Account', type: ACCT_TYPES[a.type] ? a.type : 'checking', institution: a.institution || '', balance: 0, history: [], holdings: [], apr: '', minPay: '', contribYTD: '' }; state.accounts.push(ex); }
+    amap[a.id] = ex.id;
+    if (a.balance != null && a.balanceAsOf) { ex.history = (ex.history || []).filter(h => h.d !== a.balanceAsOf); ex.history.push({ d: a.balanceAsOf, v: +a.balance }); ex.history.sort((x, y) => x.d < y.d ? -1 : 1); ex.balance = ex.history[ex.history.length - 1].v; }
+  }
+  const counts = {}; for (const t of state.transactions) { const k = txKey(t); counts[k] = (counts[k] || 0) + 1; }
+  const added = [], months = new Set(); let dupes = 0, replaced = 0;
+  for (const r of d.transactions) {
+    const accountId = amap[r.accountId] || r.accountId; if (!state.accounts.some(a => a.id === accountId)) continue;
+    const t = { id: uid(), date: r.date, desc: r.desc || r.merchant || '', amount: round2(r.amount), accountId, merchant: r.merchant || merchantName(r.desc), categoryId: CATMAP[r.categoryId] ? r.categoryId : 'uncat', notes: r.notes || '', tags: r.tags || [], business: !!r.business, excluded: !!r.excluded };
+    if (!t.date || !isFinite(t.amount)) continue;
+    const k = txKey(t); if (counts[k]) { counts[k]--; dupes++; continue; }
+    if (t.categoryId === 'uncat') { const c = categorize(t); t.categoryId = c.cat; applyRuleExtras(t, c.rule); }
+    const p = /pending/i.test(t.notes) ? null : takePending(t); if (p) { replaced++; months.add(mKey(p.date)); }
+    added.push(t); months.add(mKey(t.date));
+  }
+  state.transactions.push(...added);
+  for (const r of d.rules || []) if (r && r.text && !state.rules.some(x => x.text.toUpperCase() === String(r.text).toUpperCase())) state.rules.push({ id: uid(), text: r.text, categoryId: r.categoryId, business: !!r.business });
+  if (d.settings && d.settings.pay) state.settings.pay = { ...state.settings.pay, ...d.settings.pay };
+  touch(true, [...months]);
+  return { added: added.length, dupes, replaced };
 }
 function backupStep() {
   const d = ui.imp.data;
@@ -1771,15 +1854,17 @@ function doImport() {
   if ($('#impAcct')) { /* re-resolve after a possible demo reset */ }
   let acct = selVal !== '__new' ? state.accounts.find(a => a.id === selVal) : null;
   if (!acct) { acct = { id: uid(), name: (newName || 'Imported account').trim(), type: newType, institution: '', balance: 0, history: [], holdings: [], apr: '', minPay: '', contribYTD: '' }; state.accounts.push(acct); }
-  const { added, dupes } = buildTransactions(records, acct.id);
+  let older = 0; const cutOn = $('#impCut') && $('#impCut').checked && !$('#cutW').hidden; const cut = cutOn ? lastPostedDate(acct.id) : null;
+  if (cut) { const n = records.length; records = records.filter(r => r.date > cut); older = n - records.length; }
+  const { added, dupes, replaced } = buildTransactions(records, acct.id);
   state.transactions.push(...added);
   if (im.balance != null && !isNaN(im.balance)) { acct.balance = isLiab(acct) ? Math.abs(im.balance) : im.balance; recordBalance(acct); }
-  touch(true, txMonths(added));
+  touch(true, [...txMonths(added), ...txMonths(replaced)]);
   const latest = added.reduce((m, t) => t.date > m ? t.date : m, ''); if (latest) ui.month = mKey(latest) > THIS_MONTH ? THIS_MONTH : mKey(latest);
   const unc = added.filter(t => t.categoryId === 'uncat').length;
   render();
   $('.sheet-b').innerHTML = `<div class="stack"><h2 style="font-size:22px">Imported ${added.length} transactions into ${esc(acct.name)}</h2>
-    <div class="kv"><span>Skipped as duplicates</span><span class="num">${dupes.length}</span></div><div class="kv"><span>Still uncategorized</span><span class="num">${unc}</span></div>
+    <div class="kv"><span>Skipped as duplicates</span><span class="num">${dupes.length}</span></div>${older ? `<div class="kv"><span>Older than what's already here (skipped)</span><span class="num">${older}</span></div>` : ''}${replaced.length ? `<div class="kv"><span>Pending charges replaced by posted ones</span><span class="num">${replaced.length}</span></div>` : ''}<div class="kv"><span>Still uncategorized</span><span class="num">${unc}</span></div>
     ${!(acctBalance(acct)) ? `<label class="f">Current balance of ${esc(acct.name)} (for net worth and safe-to-spend)<input class="input num" type="number" step="0.01" id="postBal" placeholder="e.g. 1520.33"></label>` : ''}</div>`;
   setFoot(`${unc && SAMPLE ? `<button class="btn" data-act="aiCat" type="button">${ico('spark', 14)} Categorize ${unc} with Claude</button>` : ''}${ui.imp.queue && ui.imp.queue.length ? `<button class="btn" data-act="nextFile" type="button">Next file (${ui.imp.queue.length} left)</button>` : `<button class="btn" data-act="import" type="button">Import another</button>`}<button class="btn primary" data-act="finishImport" data-id="${acct.id}" type="button">Done</button>`);
   ui.imp.lastAcct = acct.id;
@@ -1898,6 +1983,7 @@ const ACT = {
   async wipe(el) { if (!armed(el)) return; await Store.wipe(); state = emptyState(); rebuildCats(); render(); toast('Everything erased.'); },
   usePaste() { const v = $('#pasteBox').value; if (!v.trim()) { toast('Paste some rows first.'); return; } ui.imp = { queue: [] }; tableStep(parseDelimited(v), 'Pasted rows'); },
   doImport() { doImport(); },
+  doLLImport() { const r = applyLedgerFile(ui.imp.data); render(); $('.sheet-b').innerHTML = `<div class="stack"><h2 style="font-size:22px">Added ${r.added} transactions</h2><div class="kv"><span>Already in Ledgerline (skipped)</span><span class="num">${r.dupes}</span></div><div class="kv"><span>Pending charges replaced by posted ones</span><span class="num">${r.replaced}</span></div></div>`; setFoot(`<button class="btn primary" data-act="closeSheet" type="button">Done</button>`); },
   nextFile() { const lastAcct = ui.imp.lastAcct; ui.imp.acctId = lastAcct; nextFile(); },
   finishImport(el) { const v = $('#postBal') && $('#postBal').value; if (v) { const a = state.accounts.find(x => x.id === el.dataset.id); if (a) { a.balance = Math.abs(parseFloat(v)) * (isLiab(a) ? 1 : Math.sign(parseFloat(v)) || 1); recordBalance(a); touch(true, []); } } closeSheet(); ui.view = 'overview'; render(); },
   doPositions() {
@@ -1926,7 +2012,7 @@ const ON = {
   acctType(el) { const t = el.value; const a = { type: t }; $('#aAprW').hidden = !isLiab(a); $('#aMinW').hidden = !isLiab(a); $('#aLimW').hidden = t !== 'credit'; $('#aConW').hidden = !['k401', 'roth', 'ira'].includes(t); $('#holdWrap').hidden = !isInvest(a); },
   mapCol(el) { ui.imp.map[el.dataset.key] = parseInt(el.value, 10); if (el.dataset.key === 'amount' && ui.imp.map.amount >= 0) { } mapStep(); },
   flip(el) { ui.imp.flip = el.checked; ui.imp.kind === 'table' ? mapStep() : recordsStep(); },
-  impAcct(el) { ui.imp.acctId = el.value === '__new' ? '' : el.value; const w = $('#newAcctW'); if (w) w.style.display = el.value === '__new' ? '' : 'none'; },
+  impAcct(el) { ui.imp.acctId = el.value === '__new' ? '' : el.value; const w = $('#newAcctW'); if (w) w.style.display = el.value === '__new' ? '' : 'none'; updateCut(); },
   posAcct(el) { $('#posNewW').style.display = el.value === '__new' ? '' : 'none'; }
 };
 
